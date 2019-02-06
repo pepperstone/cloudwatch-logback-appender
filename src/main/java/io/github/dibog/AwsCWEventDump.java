@@ -26,11 +26,14 @@ import com.amazonaws.services.logs.model.*;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static java.util.Objects.requireNonNull;
 
 class AwsCWEventDump implements Runnable {
-    private final RingBuffer<ILoggingEvent> queue = new RingBuffer<ILoggingEvent>(10);
+    private final RingBuffer<ILoggingEvent> queue;
     private final LoggingEventToString layout;
     private final AwsConfig awsConfig;
     private final boolean createLogGroup;
@@ -40,6 +43,9 @@ class AwsCWEventDump implements Runnable {
     private final ContextAware logContext;
     private final Date dateHolder = new Date();
     private final PutLogEventsRequest logEventReq;
+    private final int queueLength;
+    private final Lock lock = new ReentrantLock();
+    private final Condition readyToFlush = lock.newCondition();
 
     private volatile boolean done = false;
 
@@ -47,13 +53,15 @@ class AwsCWEventDump implements Runnable {
     private String currentStreamName = null;
     private String nextToken = null;
 
-    public AwsCWEventDump( AwsLogAppender aAppender ) {
+    public AwsCWEventDump(AwsLogAppender aAppender, int queueLength) {
         logContext = requireNonNull(aAppender, "appender");
         awsConfig = aAppender.awsConfig==null ? new AwsConfig(): aAppender.awsConfig;
         createLogGroup = aAppender.createLogGroup;
         groupName = requireNonNull(aAppender.groupName, "appender.groupName");
         logEventReq = new PutLogEventsRequest().withLogGroupName(groupName);
         streamName = requireNonNull(aAppender.streamName, "appender.streamName");
+        this.queueLength = queueLength;
+        queue = new RingBuffer<>(queueLength*10);
 
         if(aAppender.layout==null) {
             layout = new LoggingEventToStringImpl();
@@ -197,35 +205,55 @@ class AwsCWEventDump implements Runnable {
 
     public void shutdown() {
         done = true;
+        flush();
     }
 
     public void queue(ILoggingEvent event) {
-        queue.put(event);
+        lock.lock();
+        try {
+            queue.put(event);
+            if (queue.getSize() >= queueLength) {
+                readyToFlush.signal();
+            }
+        }
+        finally {
+            lock.unlock();
+        }
     }
 
     public void run() {
-        List<ILoggingEvent> collections = new LinkedList<ILoggingEvent>();
-        LoggerContextVO context = null;
         while(!done) {
-
+            lock.lock();
             try {
-                int[] nbs = queue.drainTo(collections);
-                if(context==null && !collections.isEmpty()) {
-                    context = collections.get(0).getLoggerContextVO();
+                while(queue.getSize()<queueLength) {
+                    readyToFlush.await();
                 }
-
-                int msgProcessed = nbs[0];
-                int msgSkipped = nbs[1];
-                if(context!=null && msgSkipped>0) {
-                    collections.add(new SkippedEvent(msgSkipped, context));
-                }
-                log(collections);
-                collections.clear();
+                flush();
             }
             catch(InterruptedException e) {
-                // ignoring
+                flush();
+            }
+            finally {
+                lock.unlock();
             }
         }
     }
-}
 
+    private void flush() {
+        List<ILoggingEvent> collections = new LinkedList<ILoggingEvent>();
+        LoggerContextVO context = null;
+
+        int[] nbs = queue.drainTo(collections);
+        if (!collections.isEmpty()) {
+            context = collections.get(0).getLoggerContextVO();
+        }
+
+        int msgProcessed = nbs[0];
+        int msgSkipped = nbs[1];
+        if (context != null && msgSkipped > 0) {
+            collections.add(new SkippedEvent(msgSkipped, context));
+        }
+        log(collections);
+        collections.clear();
+    }
+}
